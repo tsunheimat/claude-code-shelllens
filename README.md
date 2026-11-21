@@ -33,6 +33,7 @@ The row reports what the host says is still running and what the output files sh
 ## Inspection policy
 
 - At background handoff the plugin parses the command without running it. It recognizes common wrappers such as `timeout`, `env`, and `rtk proxy`, and can inspect literal script invocations, `source` references, and a heredoc written then invoked by the command. It follows at most six script references and three levels of nesting. It does not execute the scripts, expand variables, or resolve globs.
+- A directly called shell function contributes operations; a definition alone does not. Executed child shells and parenthesized groups have their own working directory. Sourced scripts share their caller's directory. This is a bounded static analysis, not a full shell interpreter: uncertain branches or unsupported syntax can yield partial evidence.
 - Disk reads are limited to eligible scripts under the launch directory or an explicitly named `.sh`/`.bash` file directly in `/tmp`. A parsed `cd` does not widen that boundary. Hidden paths, traversal, symlinks, special files, oversized scripts and non-text files are skipped. Script placement and metadata are checked before and after reading. This is not an isolation boundary against another process replacing files.
 - A matched ignore rule withholds the whole task's script facts and output, even when masking is off. With rules configured, inspection starts only for an identifiable literal entry script. This rule does not remove mentions in the agent's own descriptions, last message, or scheduled reminders.
 
@@ -40,7 +41,9 @@ The row reports what the host says is still running and what the output files sh
 
 One JSON record describes the pending work. Each task has a short ID, its description (up to 300 characters), inspection status, elapsed time when known, and up to 12 extracted operations. For example, a CI watcher can yield `{"run":"gh run watch","category":"CI run watch","target":"1234","waits":true}`. The record can include a script basename, a polling interval or timeout, and a count of omitted operations. These are clues about the work, not a trace of the currently executing line.
 
-For eligible tasks, the plugin samples the last 4 KiB of the host-reported output file and selects up to eight meaningful lines of at most 160 characters each. The request also includes the end of the last assistant message (about 700 characters), and schedules and short prompts for pending wakeups. The model is asked for one headline and one label per ID. Invalid fields keep their local fallback independently.
+A simple file-test loop distinguishes what is awaited from how often it is checked: `while [ ! -f /tmp/build.ready ]; do sleep 5; done` produces `build.ready to appear (every 5s)` even without a model answer. The plugin does not check whether the file currently exists. Recognized GitHub, curl, Docker, and Kubernetes commands retain relevant targets such as the repository, endpoint, image tag, or resource and namespace.
+
+For eligible tasks, the plugin samples the last 4 KiB of the host-reported output file and selects up to eight meaningful lines of at most 160 characters each. The request also includes the end of the last assistant message (about 700 characters), and schedules and short prompts for pending wakeups. The model is asked for one headline and one label per ID. A failed refresh preserves previously accepted wording for unchanged tasks. If membership changes, surviving task labels stay, but the old combined headline does not. Fields without accepted wording use a local fallback.
 
 ## Options
 
@@ -54,7 +57,7 @@ For eligible tasks, the plugin samples the last 4 KiB of the host-reported outpu
 | `redactSecrets` | `true` | Mask likely credentials in free text before selecting excerpts. Turning this off does not send script source or override ignored paths. |
 | `ignorePaths` | empty | Literal file or subtree paths, one per line, absolute or relative to the launch directory. See Inspection policy. |
 
-**Debugging:** start with `claude --plugin-dir "$PWD" --debug` and search the host debug log for `shell-insight: summary`. A line such as `tasks=3 ... facts=[read:4,read:1,read:1] model=haiku source=model headline=accepted labels=3/3` confirms that the model supplied the displayed wording; `source=fallback` gives a reason. The plugin's diagnostic does not include script bodies, output, prompts or replies. Host and provider logs have their own policies. The plugin only observes Bash; it never intercepts or reruns a command.
+**Debugging:** start with `claude --plugin-dir "$PWD" --debug` and search the host debug log for `shell-insight: summary`. A line such as `tasks=3 ... facts=[read:4,read:1,read:1] model=haiku source=model headline=accepted labels=3/3` confirms that the model supplied the displayed wording. `source=fallback` means no model wording was used, `source=retained` means prior wording was kept, and `source=discarded` marks a stale request. The plugin's diagnostic does not include script bodies, output, prompts or replies. Host and provider logs have their own policies. The plugin only observes Bash; it never intercepts or reruns a command.
 
 ## Verify
 

@@ -145,7 +145,7 @@ test('a malformed or unsafe reply keeps the fallback', async ($, on) => {
   await stop($)
   await h.clock.advance(1500)
   const [head] = await lines($)
-  expect(head?.text).toContain('CI run watch 1234 and Container image build and Tests')
+  expect(head?.text).toMatch(/CI run watch 1234 and Container image build.* and Tests/)
   expect(head?.text).not.toContain('rm -rf')
 })
 
@@ -228,6 +228,60 @@ test('a single output change during cooldown is summarized once even if output t
   expect(payload(h.prompts[1]!).tasks[0].recentOutput).toContain('package stage now running')
   await h.clock.advance(65000)
   expect(h.prompts).toHaveLength(2)
+})
+
+test('keep accepted purpose wording during and after an unsuccessful refresh; accept later fields independently', async ($, on) => {
+  const reply: Reply = { text: '{"headline":"Release checks before deployment","tasks":{"1":"Release pipeline checks"}}' }
+  const h = host(on, reply)
+  await launch($, h, 1)
+  await stop($, 1)
+  await h.clock.advance(2000)
+  const check = async (headline: string, label: string) => {
+    const [head, detail] = await lines($)
+    expect(head?.text).toContain(headline)
+    expect(detail?.text).toContain(label)
+  }
+  await check('Release checks before deployment', 'Release pipeline checks')
+
+  delete reply.text
+  reply.delay = 5000
+  h.mtimes['/claude/tasks/t1.output'] = h.clock.now()
+  await h.clock.advance(59000)
+  expect(h.prompts).toHaveLength(2)
+  await check('Release checks before deployment', 'Release pipeline checks')
+  await h.clock.advance(6000)
+  await check('Release checks before deployment', 'Release pipeline checks')
+
+  reply.delay = 0
+  reply.text = '{"headline":"CI has completed","tasks":{"1":"Release workflow validation"}}'
+  h.mtimes['/claude/tasks/t1.output'] = h.clock.now()
+  await h.clock.advance(60000)
+  expect(h.prompts).toHaveLength(3)
+  await check('Release checks before deployment', 'Release workflow validation')
+
+  reply.text = '{"headline":"Deployment gate checks","tasks":{"1":"TOKEN=abc"}}'
+  h.mtimes['/claude/tasks/t1.output'] = h.clock.now()
+  await h.clock.advance(60000)
+  expect(h.prompts).toHaveLength(4)
+  await check('Deployment gate checks', 'Release workflow validation')
+})
+
+test('a failed refresh retains only surviving labels and never restores the old combined headline', async ($, on) => {
+  const reply: Reply = { text: '{"headline":"CI checks and image preparation","tasks":{"1":"Workflow checks","2":"API packaging"}}' }
+  const h = host(on, reply)
+  await launch($, h, 2)
+  await stop($, 2)
+  await h.clock.advance(2000)
+  expect((await lines($))[0]?.text).toContain('CI checks and image preparation')
+  await finish($, 't1')
+  delete reply.text
+  await h.clock.advance(61000)
+  expect(h.prompts).toHaveLength(2)
+  const [head, detail] = await lines($)
+  expect(head?.text).toContain('API packaging')
+  expect(head?.text).not.toContain('CI checks')
+  expect(detail?.text).toContain('API packaging')
+  expect(detail?.text).not.toContain('Workflow checks')
 })
 
 test('discard an in-flight answer for finished work and refresh only the surviving task', async ($, on) => {

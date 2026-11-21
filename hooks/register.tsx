@@ -13,6 +13,7 @@ type Background = { id: string; type: string; status: string; description: strin
 type Cron = { id?: string; schedule?: string; prompt: string }
 /** What was learned about a task when it went to the background. */
 type Launch = { startedAt?: number; output?: string; facts?: Promise<Facts | undefined> }
+type Purposes = { labels: Map<string, string>; headline?: { version: number; text: string } }
 
 const STALE_MS = 2 * 60 * 1000
 const RESUMMARIZE_MS = 60 * 1000
@@ -134,18 +135,27 @@ export const register: Register = (on, options) => {
   }
 
   // One model request for everything still pending, built from the task set current now.
-  async function summarize(save: (f: (w: Wait) => Wait) => Promise<unknown>, h: Host, signal: AbortSignal) {
+  async function summarize(save: (f: (w: Wait) => Wait) => Promise<unknown>, h: Host, signal: AbortSignal, purposes: Purposes) {
     const n = ++attempt, v = version, tasks = pending, wakes = crons
     const sessionCwd = await h.cwd().catch(() => '')
     const now = await h.now()
     const facts = await Promise.all(tasks.map(t =>
       launched.get(t.id)?.facts ?? (t.command ? factsFor(h, t.command, sessionCwd) : Promise.resolve(undefined))))
     if (signal.aborted || v !== version) return
-    // Labels from facts first, so the row improves even when the model gives nothing.
-    const labels = tasks.map((t, i) => fallbackLabel(t, facts[i]))
+    const fallback = new Map(tasks.map((t, i) => [t.id, fallbackLabel(t, facts[i])] as const))
     const stale = () => signal.aborted || v !== version
-    await save(w => stale() || w.kind !== 'waiting' ? w : { ...w, headline: fallbackHeadline(labels, wakes),
-      tasks: w.tasks.map(r => { const i = tasks.findIndex(t => t.id === r.id); return i < 0 ? r : { ...r, label: labels[i]! } }) })
+    const headline = () => purposes.headline?.version === v ? purposes.headline.text : undefined
+    const existing = headline() || tasks.some(t => purposes.labels.has(t.id)) ? 'retained' : 'fallback'
+    const draw = () => save(w => {
+      if (stale() || w.kind !== 'waiting') return w
+      const rows = w.tasks.map(t => {
+        const label = purposes.labels.get(t.id) ?? fallback.get(t.id)
+        return label && label !== t.label ? { ...t, label } : t
+      })
+      const text = headline() ?? fallbackHeadline(rows.map(r => r.label), wakes)
+      return text === w.headline && rows.every((r, i) => r === w.tasks[i]) ? w : { ...w, tasks: rows, headline: text }
+    })
+    await draw()
 
     const inputs: TaskInput[] = []
     for (const [i, t] of tasks.entries()) {
@@ -167,23 +177,21 @@ export const register: Register = (on, options) => {
       reply = await h.complete({ model, effort: 'low', maxTokens: replyTokens(ids.length), timeoutMs, system: SYSTEM_PROMPT,
         prompt: waitPrompt(inputs, wakeups, lastMessage, language, mask) }, signal)
     } catch (error) {
-      h.debug(`summary ${sent} source=fallback reason=request-error (${error instanceof Error ? error.name : 'error'})`)
+      h.debug(`summary ${sent} source=${stale() ? 'discarded' : existing} reason=request-error (${error instanceof Error ? error.name : 'error'})`)
       return
     }
-    if (signal.aborted || v !== version) { h.debug(`summary ${sent} source=fallback reason=stale-task-set`); return }
-    if (!reply.isAnswered) { h.debug(`summary ${sent} source=fallback reason=no-answer (${reply.reason})`); return }
+    if (stale()) { h.debug(`summary ${sent} source=discarded reason=stale-task-set`); return }
+    if (!reply.isAnswered) { h.debug(`summary ${sent} source=${existing} reason=no-answer (${reply.reason})`); return }
     const parsed = parseWait(reply.text, ids)
     const accepted = Object.keys(parsed.tasks).length
-    h.debug(`summary ${sent} source=${parsed.headline || accepted ? 'model' : 'fallback'} headline=${parsed.headline ? 'accepted' : 'fallback'} ` +
+    h.debug(`summary ${sent} source=${parsed.headline || accepted ? 'model' : existing} headline=${parsed.headline ? 'accepted' : headline() ? 'retained' : 'fallback'} ` +
       `labels=${accepted}/${ids.length}${parsed.problems.length ? ` problems=${parsed.problems.join('; ')}` : ''}`)
-    await save(w => stale() || w.kind !== 'waiting' ? w : {
-      ...w, headline: parsed.headline ?? w.headline,
-      tasks: w.tasks.map(r => {
-        const i = tasks.findIndex(t => t.id === r.id)
-        const label = i < 0 ? undefined : parsed.tasks[String(i + 1)]
-        return label ? { ...r, label } : r
-      }),
-    })
+    if (parsed.headline) purposes.headline = { version: v, text: parsed.headline }
+    for (const [i, t] of tasks.entries()) {
+      const label = parsed.tasks[String(i + 1)]
+      if (label) purposes.labels.set(t.id, label)
+    }
+    await draw()
   }
 
   on('session.start', ($, e, next) => {
@@ -269,12 +277,15 @@ export const register: Register = (on, options) => {
       // cooldown allows, from the task set current at that moment.
       let inFlight = false, dirty = false, lastSummary = now, ticks = 0, seen = version
       const outputAt = new Map<string, number>()
+      // The model sees positional IDs; retain validated labels by the host's stable IDs.
+      // The headline, unlike a task label, belongs to one exact task-set version.
+      const purposes: Purposes = { labels: new Map() }
       const own = stop = new AbortController()
       const run = () => {
         if (inFlight) return
         inFlight = true; dirty = false; seen = version
         h.after(0, async () => {
-          try { await summarize(save, h, own.signal) } catch { /* keep the fallback */ }
+          try { await summarize(save, h, own.signal, purposes) } catch { /* leave the current wording in place */ }
           finally { inFlight = false }
         })
       }

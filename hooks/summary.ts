@@ -69,10 +69,10 @@ const SYSTEM = 'You write a short status for a developer: what a stopped coding 
 const INSTRUCTIONS = `The main coding turn has ended. The background work in the data record is still running. Describe the concrete work that remains and, when the evidence shows it, what result or condition is being awaited.
 
 Evidence, per task:
-- "steps": the external commands the task runs, extracted by code from its command and scripts (no source is given). "waits": it blocks on something external. "every": it repeats, with that pause. "limit": a timeout.
+- "steps": static evidence about operations, not a trace of what is executing now. "partial": some behavior could not be determined. Do not fill in missing operations. "condition": what a wait is checking for. "every": the polling interval, not the awaited result. "limit": a timeout.
 - "scriptStatus": "read" means its script was analyzed; "inline" means the command itself was; "dynamic", "unavailable" and "ignored" mean the script was not analyzed, so the steps may be incomplete.
 - "description": the agent's own label for the task. It may be generic ("Run script A"); prefer specific evidence.
-- "recentOutput": its newest output lines. Use them for the current stage only when they clearly show it.
+- "recentOutput": its newest output lines. Use them to identify the purpose and awaited condition; write labels that remain useful as the task advances, not transient stage or progress claims.
 - "agentLastMessage": the end of the agent's last message. Use it for why the work was started.
 - A "scheduled wakeup" resumes the agent later with its prompt.
 
@@ -84,14 +84,15 @@ Writing:
 - If a task's purpose cannot be told from the evidence, call it "unidentified background task".
 
 Reply with only {"headline": string, "tasks": {"<id>": string}}:
-- "headline": all remaining work together, 6 to 16 words.
-- "tasks": one label for every id, 3 to 7 words each.
+- "headline": the shortest clear description of all remaining work, normally at most 16 words.
+- "tasks": one concise label per id, normally at most 7 words. Shorter is fine.
 
 Examples of evidence and good wording:
 - gh run watch (waits), agent: "Pushed the fix; I'll deploy once CI passes" → "GitHub Actions run for the fix, before deployment"
 - sleep 200s with limit 100s (waits), output "Waiting for the 100-second timer" → "100-second timer test"
 - curl api.example.com/health every 10s, kubectl rollout status deploy/api → "API rollout and health checks on api.example.com"
-- grep README.md, repeated → "Repeated README heading count"
+- category "Markdown heading count", target README.md, repeated → "Repeated README heading count"
+- target build.ready, condition "file exists", every 5s → "Readiness marker checked every five seconds"
 - scheduled wakeup "check the deploy" → "Next scheduled deployment check"
 - scriptStatus unavailable, generic description, no output → "unidentified background task"`
 
@@ -105,6 +106,7 @@ export function waitPrompt(tasks: TaskInput[], wakeups: WakeupInput[], lastMessa
         id: t.id,
         description: maskLines(t.description, mask).slice(0, 300),
         scriptStatus: t.facts?.scriptStatus ?? 'unavailable',
+        ...(t.facts?.partial ? { partial: true } : {}),
         ...(t.facts?.script ? { script: t.facts.script } : {}),
         steps: t.facts?.steps ?? [],
         ...(t.facts?.omitted ? { stepsOmitted: t.facts.omitted } : {}),
@@ -129,8 +131,17 @@ export function replyTokens(count: number): number {
 }
 
 const unsafe = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}`<>|{}$\\]|\*\*|\[[^\]]*\]\(|^(?:[-*#>]|\d+[.)]\s)/u
-// The interface reports timing and liveness; a summary must not claim an outcome.
-const outcome = /\b(?:succeeded|successful(?:ly)?|failed|failing|passed|finished|completed?|done|stuck|hung|hanging|crashed|broken|timed out)\b|\d+\s*[%％]/i
+// A wording guard, not a multilingual truth detector. A condition ("to complete")
+// or object ("retry of failed checks") is different from a predicate ("CI failed").
+const statusWords = '(?:succeeded|successful|failed|failing|passed|finished|completed?|done|stuck|hung|hanging|crashed|broken|timed out)'
+const statedStatus = new RegExp(`\\b(?:is|are|was|were|has|have|had|remains?)\\s+(?:(?:now|already|just|been)\\s+)*${statusWords}\\b`, 'i')
+const bareStatus = new RegExp(`\\b${statusWords}\\b(?=\\s*(?:$|[.,;:!?]|\\b(?:and|but|because|on|at|in|after|with|unexpectedly|successfully)\\b))`, 'i')
+
+function assertsOutcome(text: string) {
+  if (/\d+\s*[%％]|已(?:经|經)?(?:完成|成功|失败|失敗|通过|通過|超时|逾時)(?!的)/u.test(text)) return true
+  const clause = text.replace(/\bto\s+(?:complete|be\s+(?:complete[d]?|finished|done|successful|passed))\b/gi, '')
+  return statedStatus.test(clause) || bareStatus.test(clause)
+}
 
 /** A display-safe phrase, shortened at a word to at most `max` characters, or undefined. */
 export function phrase(value: unknown, max: number): string | undefined {
@@ -146,9 +157,9 @@ export function phrase(value: unknown, max: number): string | undefined {
 
 /** A model-written phrase: safe, free of outcome claims, without a leading "Waiting". */
 export function wording(value: unknown, max: number): string | undefined {
-  if (typeof value !== 'string') return undefined
+  if (typeof value !== 'string' || value.length > 600) return undefined
   const text = value.trim().replace(/^waiting\s+(?:for|on)\s+/i, '')
-  if (outcome.test(text)) return undefined
+  if (assertsOutcome(text)) return undefined
   const p = phrase(text, max)
   return p && p[0] ? p[0].toUpperCase() + p.slice(1) : p
 }

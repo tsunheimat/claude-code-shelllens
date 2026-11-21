@@ -117,3 +117,62 @@ test('the manual examples have meaningful labels without script source or a mode
     assert.doesNotMatch(JSON.stringify(f), /require\(|#!\/bin\/sh|printf/)
   }
 })
+
+test('the readiness guard is the awaited condition; sleep is only its cadence', async () => {
+  for (const [guard, condition] of [
+    ['while [ ! -f /tmp/build.ready ]', 'regular file exists'],
+    ['until test -e /tmp/build.ready', 'path exists'],
+    ['while ! [[ -d /tmp/build.ready ]]', 'directory exists'],
+    ['while test -e /tmp/build.ready', 'path absent'],
+    ['until [ ! -d /tmp/build.ready ]', 'directory absent'],
+  ]) {
+    const f = await factsOf(`${guard}; do sleep 5; done`, '/w', reader)
+    assert.deepEqual(f.steps, [{run: 'test', category: 'file wait', condition, target: 'build.ready', waits: true, every: '5s'}])
+    assert.match(factLabel(f), condition.endsWith('absent') ? /build.ready to disappear/ : /build.ready to appear/)
+    assert.doesNotMatch(JSON.stringify(f), /\/tmp\//)
+  }
+  const complex = await factsOf('while [ ! -f /tmp/a ] && [ ! -f /tmp/b ]; do sleep 5; done', '/w', reader)
+  assert.equal(complex.partial, true)
+  assert.equal(complex.steps[0].category, 'polling loop')
+  assert.equal(complex.steps[0].condition, undefined)
+})
+
+test('function bodies are traversed only on a direct call, in declaration order', async () => {
+  const definition = "unused() {\n printf '%s' '}';\n sh ci.sh;\n}\n"
+  const opened = []
+  const read = async path => { opened.push(path); return reader(path) }
+  const f = await factsOf(definition + 'sleep 200', '/w', read)
+  assert.equal(factLabel(f), 'Timer 200s')
+  assert.deepEqual(opened, [])
+  const called = await factsOf(definition + 'unused', '/w', read)
+  assert.deepEqual(opened, ['/w/ci.sh'])
+  assert.ok(runs(called).includes('gh run watch'))
+  const double = await factsOf('f() { sleep 1; }; f; function f { sleep 2; }; f', '/w', reader)
+  assert.deepEqual(double.steps.map(s => s.target), ['1s', '2s'])
+  const recursive = await factsOf('again() { again; }; again; sleep 10', '/w', reader)
+  assert.equal(recursive.partial, true)
+  assert.equal(factLabel(recursive), 'Timer 10s')
+  const unsupported = await factsOf('f() if true; then gh run watch 42; fi', '/w', reader)
+  assert.equal(unsupported.partial, true)
+  assert.deepEqual(unsupported.steps, [])
+})
+
+test('child shell directory and functions are isolated; sourced and called functions share the caller', async () => {
+  const scripts = {'/w/first.sh': 'cd sub\nhelper() { sleep 72; }', '/w/second.sh': 'npm test', '/w/sub/second.sh': 'npm run build'}
+  for (const [prefix, shared] of [['bash first.sh', false], ['. first.sh', true], ["sh -c '. first.sh'", false],
+    ['( . first.sh )', false], ['f() ( . first.sh ); f', false], ['f() { . first.sh; }; f', true]]) {
+    const opened = []
+    const f = await factsOf(`${prefix}\nsh second.sh\nhelper`, '/w', async path => { opened.push(path); return {body:scripts[path]} })
+    assert.deepEqual(opened, ['/w/first.sh', shared ? '/w/sub/second.sh' : '/w/second.sh'], prefix)
+    assert.equal(runs(f).includes('sleep'), shared, prefix)
+    assert.ok(runs(f).includes(shared ? 'npm run build' : 'npm test'), prefix)
+  }
+})
+
+test('a computed cd does not cause script reads at a guessed directory', async () => {
+  const opened = []
+  const f = await factsOf('cd "$DIR"; sh ci.sh', '/w', async p => { opened.push(p); return reader(p) })
+  assert.deepEqual(opened, [])
+  assert.equal(f.partial, true)
+  assert.equal(f.scriptStatus, 'dynamic')
+})

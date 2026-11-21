@@ -18,6 +18,8 @@ export type Step = {
   category?: string
   /** A safe identifier of what it acts on: a tag, host, run ID, `$VAR`, a file name. */
   target?: string
+  /** The condition the loop is waiting for, not an observed filesystem state. */
+  condition?: string
   /** It repeats in a loop, with this sleep between rounds when one is given. */
   every?: string
   /** It runs under `timeout` with this limit. */
@@ -26,7 +28,7 @@ export type Step = {
   waits?: boolean
 }
 
-export type Facts = { scriptStatus: ScriptStatus; script?: string; steps: Step[]; omitted: number }
+export type Facts = { scriptStatus: ScriptStatus; script?: string; steps: Step[]; omitted: number; partial?: true }
 
 /**
  * Reads one script by absolute path, the way inspect() allows, judged against the task's
@@ -34,8 +36,8 @@ export type Facts = { scriptStatus: ScriptStatus; script?: string; steps: Step[]
  */
 export type ScriptReader = (path: string, inlineBody?: string) => Promise<{ body?: string; ignored?: boolean }>
 
-type Cmd = { words: string[]; heredoc?: string; out?: string; loop?: number }
-type Lexed = { cmds: Cmd[]; loops: Map<number, string> }
+type Cmd = { words: string[]; heredoc?: string; out?: string; loop?: number; guard?: 'while' | 'until'; negated?: boolean; definition?: Lexed; subshell?: Lexed }
+type Lexed = { cmds: Cmd[]; loops: Map<number, string>; partial: boolean; end?: number; groupedShell?: boolean }
 
 const MAX_TEXT = 512 * 1024
 const MAX_CMDS = 600
@@ -62,10 +64,13 @@ function matchParen(text: string, open: number) {
 }
 
 /** Split shell text into simple commands. Quotes are removed; expansions stay as text. */
-export function lex(text: string, depth = 0): Lexed {
+export function lex(text: string, depth = 0, start = 0, close?: '}' | ')'): Lexed {
   const cmds: Cmd[] = []
   const loops = new Map<number, string>()
-  if (text.length > MAX_TEXT || depth > MAX_DEPTH) return { cmds, loops }
+  let partial = false, end: number | undefined
+  if (text.length > MAX_TEXT || depth > MAX_DEPTH) return { cmds, loops, partial: true }
+  const functionHead = /(?:function[ \t]+([A-Za-z_]\w*)(?:[ \t]*\([ \t]*\))?(?=[\s{(])|([A-Za-z_]\w*)[ \t]*\([ \t]*\))[ \t\r\n]*/y
+  let groups = 0
   const stack: number[] = []
   let loopId = 0
   let words: string[] = [], word = '', started = false
@@ -81,31 +86,63 @@ export function lex(text: string, depth = 0): Lexed {
     }
     word = ''; started = false
   }
-  const endCommand = () => {
+  const endCommand = (singleGuard = false) => {
     endWord()
     let w = words
     words = []
     while (w.length) {
       const k = w[0]!
-      if (k === 'while' || k === 'until') { stack.push(++loopId); loops.set(loopId, k); w = w.slice(1); continue }
+      if (k === 'while' || k === 'until') {
+        stack.push(++loopId); loops.set(loopId, k)
+        if (singleGuard) current.guard = k
+        else partial = true
+        w = w.slice(1); continue
+      }
       if (k === 'for' || k === 'select') { stack.push(++loopId); loops.set(loopId, 'for'); w = []; break }
       if (k === 'done') { stack.pop(); w = w.slice(1); continue }
+      if (['if', 'elif', 'else', 'case'].includes(k)) partial = true
+      if (k === '!' && current.guard) current.negated = !current.negated
       if (['do', 'then', 'else', 'elif', 'if', 'fi', '!', 'time', '{', '}', 'esac'].includes(k)) { w = w.slice(1); continue }
       if (k === 'case' || k === 'function' || /^[^\s()]+\)$/.test(k)) { w = []; break }
       break
     }
     const cmd = current
     current = { words: [] }
-    if (w.length && cmds.length < MAX_CMDS) { cmd.words = w; cmd.loop = stack[stack.length - 1]; cmds.push(cmd) }
+    if (cmds.length >= MAX_CMDS) partial = true
+    else if (w.length) { cmd.words = w; cmd.loop = stack[stack.length - 1]; cmds.push(cmd) }
     else if (cmd.heredoc !== undefined || heredocs.some(h => h.cmd === cmd)) { cmd.words = w }
   }
   const nested = (inner: string) => {
-    const sub = lex(inner, depth + 1)
-    for (const c of sub.cmds) if (cmds.length < MAX_CMDS) cmds.push({ ...c, loop: stack[stack.length - 1] })
+    if (cmds.length < MAX_CMDS) cmds.push({ words: [], subshell: lex(inner, depth + 1), loop: stack[stack.length - 1] })
+    else partial = true
   }
 
-  for (let i = 0; i < text.length; i++) {
+  for (let i = start; i < text.length; i++) {
     const c = text[i]!
+    if (!started && !redirect && words.every(w => ['then', 'do', 'else', '{'].includes(w)) && /[A-Za-z_]/.test(c)) {
+      functionHead.lastIndex = i
+      const m = functionHead.exec(text)
+      if (m) {
+        endCommand()
+        const opener = text[functionHead.lastIndex]
+        // Unrecognized function syntax must never turn the definition into top-level work.
+        if (opener !== '{' && opener !== '(') { partial = true; break }
+        const body = lex(text, depth + 1, functionHead.lastIndex + 1, opener === '{' ? '}' : ')')
+        if (body.end === undefined) { partial = true; break }
+        if (opener === '(') body.groupedShell = true
+        if (cmds.length < MAX_CMDS) cmds.push({ words: [m[1] ?? m[2]!], definition: body })
+        else partial = true
+        i = body.end; continue
+      }
+    }
+    if (!started && c === '{' && /[\s;]/.test(text[i + 1] ?? ' ') && words.every(w => ['then', 'do', 'else', '!'].includes(w))) {
+      groups++; continue
+    }
+    if (!started && !words.length && c === '}' && /[\s;&|)]/.test(text[i + 1] ?? ' ')) {
+      if (groups) groups--
+      else if (close === '}') { end = i; break }
+      continue
+    }
     if (c === '\\') {
       if (text[i + 1] === '\n') { i++; continue }
       word += text[i + 1] ?? ''; started = true; i++; continue
@@ -151,7 +188,7 @@ export function lex(text: string, depth = 0): Lexed {
     }
     if (c === ' ' || c === '\t' || c === '\r') { endWord(); continue }
     if (c === '\n') {
-      endCommand()
+      endCommand(/^\s*do\b/.test(text.slice(i + 1, i + 129)))
       // Heredoc bodies are data: attach them to their command and skip them.
       let pos = i + 1
       for (const h of heredocs.splice(0)) {
@@ -167,12 +204,25 @@ export function lex(text: string, depth = 0): Lexed {
       i = pos - 1; continue
     }
     if (c === ';' || c === '&' || c === '|') {
-      endCommand()
+      endCommand(c === ';' && /^\s*do\b/.test(text.slice(i + 1, i + 129)))
       while (';&|'.includes(text[i + 1] ?? 'x')) i++
       continue
     }
     if (c === '(' || c === ')') {
-      if (c === '(' && text[i + 1] === ')') { words = []; word = ''; started = false; i++; continue } // name() {
+      if (c === ')' && close === ')') {
+        // A case-pattern terminator is not the end of this subshell. Don't let
+        // the rest of an uncalled definition escape at an ambiguous boundary.
+        if (word === 'case' || words.includes('case') || partial) { partial = true; break }
+        end = i; break
+      }
+      if (c === '(' && !started && !words.length) {
+        const body = lex(text, depth + 1, i + 1, ')')
+        if (body.end === undefined) { partial = true; break }
+        if (cmds.length < MAX_CMDS) cmds.push({ words: [], subshell: body })
+        else partial = true
+        i = body.end; continue
+      }
+      if (c === '(' && text[i + 1] === ')') { partial = true; words = []; word = ''; started = false; break }
       endCommand(); continue
     }
     if (c === '<' || c === '>') {
@@ -194,7 +244,7 @@ export function lex(text: string, depth = 0): Lexed {
     word += c; started = true
   }
   endCommand()
-  return { cmds, loops }
+  return { cmds, loops, partial, end }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +258,7 @@ const QUIET = new Set(['echo', 'printf', 'true', 'false', ':', 'set', 'export', 
 const SHELLS = new Set(['bash', 'sh', 'dash', 'zsh', 'ksh'])
 // CLIs whose first one or two words name the operation.
 const SUBCOMMANDS: Record<string, number> = {
-  gh: 2, glab: 2, git: 1, docker: 2, podman: 2, kubectl: 2, oc: 2, helm: 1, npm: 2, pnpm: 2, yarn: 2, bun: 2,
+  glab: 2, git: 1, podman: 2, oc: 2, helm: 1, npm: 2, pnpm: 2, yarn: 2, bun: 2,
   npx: 1, cargo: 1, go: 1, terraform: 1, tofu: 1, pulumi: 1, aws: 2, gcloud: 3, az: 2, fly: 1, flyctl: 1,
   vercel: 1, netlify: 1, firebase: 1, make: 1, just: 1, task: 1, poetry: 1, uv: 1, pip: 1, dotnet: 1, mvn: 1,
   gradle: 1, gradlew: 1, bazel: 1, skaffold: 1, argocd: 2, gsutil: 1, wrangler: 1, nx: 1, turbo: 1, deno: 1,
@@ -220,7 +270,8 @@ const VALUE_FLAGS = /^--?(?:t|tag|n|namespace|repo|R|w|workflow|b|branch|env|env
 const FLAG_NAMES: Record<string, string> = { '-n': 'namespace', '-t': 'tag', '-R': 'repo', '-w': 'workflow',
   '-b': 'branch', '-a': 'app', '-f': 'file', '-j': 'job' }
 const CATEGORIES: [RegExp, string, boolean?][] = [
-  [/^(gh run watch|gh pr checks|gh run view|glab ci (status|view)|glab pipeline)/, 'CI run watch', true],
+  [/^(gh run watch|glab ci (status|view)|glab pipeline)/, 'CI run watch', true],
+  [/^gh pr checks$|^gh run view$/, 'CI status read'],
   [/^gh run list|^gh workflow (view|list)/, 'CI run lookup'],
   [/^gh workflow run|^glab ci run/, 'CI workflow trigger'],
   [/^gh pr (merge|create)/, 'pull request update'],
@@ -261,13 +312,18 @@ const knownToken = /\b(?:sk-|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AKIA|ASIA
 /** A value safe to show: an identifier, tag, host, number or variable name. */
 export function safeTarget(value: string): string | undefined {
   if (!value || value.length > 400) return undefined
-  const url = /^(https?|wss?):\/\/(?:[^@/\s]*@)?([\w.-]+(?::\d+)?)([^?#\s]*)/.exec(value)
+  const url = /^(?:https?|wss?):\/\/(?:[^@/?#\s]*@)?([\w.-]+(?::\d+)?)(\/[^?#\s]*)?(?:[?#]\S*)?$/.exec(value)
   if (url) {
-    if (secretish.test(url[2]!) || knownToken.test(url[2]!)) return undefined
-    const path = url[3]!.split('/').filter(s => /^[\w.-]{1,30}$/.test(s) && !/[0-9a-f]{20,}/i.test(s)
-      && !secretish.test(s) && !knownToken.test(s)).slice(0, 2)
-    return [url[2], ...path].join('/')
+    const host = url[1]!
+    if (secretish.test(host) || knownToken.test(host) || /[0-9a-f]{24,}/i.test(host) || host.length > 120) return undefined
+    const parts = [host]
+    for (const part of (url[2] ?? '').split('/').slice(1, 3)) {
+      if (!/^[\w.-]{1,30}$/.test(part) || /[0-9a-f]{20,}/i.test(part) || secretish.test(part) || knownToken.test(part)) break
+      parts.push(part)
+    }
+    return parts.join('/')
   }
+  if (value.includes('://')) return undefined
   if (value.length > 120 || secretish.test(value) || knownToken.test(value)) return undefined
   if (value.includes(COMPUTED)) return value === COMPUTED ? 'computed value' : undefined
   const variable = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value)
@@ -277,10 +333,117 @@ export function safeTarget(value: string): string | undefined {
   return value.includes('/') && !/^[\w.-]+\/[\w.-]+$/.test(value) ? basename(value) : value
 }
 
+// These four tools have incompatible option arities (curl -s, docker build -t,
+// etc.). Drop opaque values and stop at an unknown flag: guessing its arity can
+// turn a password, inline program or filename into an apparent target.
+function cliOptions(ops: string, switches: string, values: string) {
+  return { ops: new Set(ops.split('|')), switches: new Set(switches.split(' ')), values: new Set(values.split(' ')) }
+}
+const CLI = {
+  gh: cliOptions('run watch|run view|run list|pr checks|pr merge|pr create|workflow run|workflow list|workflow view',
+    '--watch --exit-status --compact --fail-fast --required --log --log-failed --web --verbose --auto --merge --squash --rebase',
+    '-R --repo -w --workflow --interval --json -q --jq -t --template --limit -L -b --branch --status --event --commit -f --raw-field -F --field --ref --job'),
+  curl: cliOptions('', '-s -S -f -L -I -i -k -v -g -G -N --silent --show-error --fail --fail-with-body --location --head --insecure --compressed --no-buffer',
+    '--url -u --user -H --header -d --data --data-raw --data-binary --data-urlencode -X --request -o --output -b --cookie -c --cookie-jar --proxy-user --oauth2-bearer --max-time -m --connect-timeout --retry -w --write-out'),
+  docker: cliOptions('build|image build|buildx build|buildx bake|push|image push|compose up|run|start',
+    '--pull --no-cache --load --push --quiet -q --detach -d --rm -i --interactive',
+    '-t --tag --build-arg --secret --ssh --label -f --file --platform --progress --target --context --config -H --host --builder --output -o -e --env --env-file --name'),
+  kubectl: cliOptions('rollout status|rollout restart|wait|apply|set image|create|scale|logs|get|describe',
+    '-w --watch --watch-only --follow --all --all-namespaces -A --ignore-not-found',
+    '-n --namespace --context --cluster --user --token --username --password --kubeconfig -s --server --request-timeout --timeout --for --revision -o --output -l --selector -f --filename -c --container --replicas --field-selector'),
+}
+type Cli = keyof typeof CLI
+const numericLimit = /^\d{1,9}(?:\.\d{1,4})?[smhd]?$/
+
+function knownCli(tool: Cli, args: string[], limit?: string): Step {
+  const { ops, switches, values } = CLI[tool]
+  const pos: string[] = [], flags = new Map<string, string>()
+  let help = false
+  for (let i = 0; i < Math.min(args.length, 256); i++) {
+    const a = args[i]!
+    if (a === '--') break
+    if (a === '--help' || a === '-h' || a === '--version') { help = true; break }
+    if (!a.startsWith('-')) {
+      if (pos.length < 5) pos.push(a)
+      // Everything after the image may be arbitrary arguments to the container.
+      if (tool === 'docker' && pos[0] === 'run' && pos.length === 2) break
+      continue
+    }
+    const eq = a.indexOf('=')
+    let key = eq === -1 ? a : a.slice(0, eq), val = eq === -1 ? undefined : a.slice(eq + 1)
+    if (tool === 'curl' && /^-[sSfLIikvgGN]{2,}$/.test(a)) continue
+    if (!a.startsWith('--') && a.length > 2 && values.has(a.slice(0, 2))) { key = a.slice(0, 2); val = a.slice(2).replace(/^=/, '') }
+    // -f means follow for logs, but takes a filename for apply; -t allocates
+    // a tty for run, but takes an image tag for build.
+    if (switches.has(key) || (tool === 'kubectl' && pos[0] === 'logs' && key === '-f') || (tool === 'docker' && pos[0] === 'run' && key === '-t')) {
+      if (val !== undefined && val !== 'true' && val !== 'false') break
+      flags.set(key, val ?? 'true'); continue
+    }
+    if (!values.has(key)) break
+    val ??= args[++i]
+    if (val === undefined || val.startsWith('-')) break
+    flags.set(key, val)
+  }
+  const pair = `${pos[0]} ${pos[1]}`
+  const op = ops.has(pair) ? pair : pos[0] && !pos[0].includes(' ') && ops.has(pos[0]) ? pos[0] : ''
+  const run = op && !help ? `${tool} ${op}` : tool
+  const step: Step = { run }
+  if (limit && numericLimit.test(limit)) step.limit = limit
+  if (help || (!op && tool !== 'curl')) return step
+  const cat = CATEGORIES.find(([re]) => re.test(run))
+  if (cat) step.category = cat[1]
+  if (cat?.[2]) step.waits = true
+  const first = pos[op ? op.split(' ').length : 0]
+  const named = (...keys: string[]) => keys.map(k => flags.get(k)).find(v => v !== undefined)
+  // Require an entire identifier in the role we expect. Do not extract a
+  // convenient-looking basename from a command string or a credential URL.
+  const id = (s: string | undefined, pattern: RegExp) => {
+    if (!s || !safeTarget(s)) return undefined
+    if (/^\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})$/.test(s)) return safeTarget(s)
+    return pattern.test(s) ? s : undefined
+  }
+  let target: string | undefined, scope: string | undefined, role = ''
+  if (tool === 'curl') {
+    const url = flags.get('--url') ?? first
+    if (url && /^https?:\/\//.test(url)) target = safeTarget(url)
+  } else if (tool === 'gh') {
+    if (/^(?:run (?:watch|view)|pr (?:checks|merge))$/.test(op)) target = id(first, /^\d{1,20}$/)
+    if (op.startsWith('workflow ') || op === 'run list') target = id(op === 'run list' ? named('-w', '--workflow') : first, /^[\w.-]+$/)
+    scope = id(named('-R', '--repo'), /^[\w.-]+\/[\w.-]+$/); role = 'repo'
+    if (op === 'pr checks' && flags.get('--watch') === 'true') { step.category = 'CI run watch'; step.waits = true }
+  } else if (tool === 'docker') {
+    const image = /^(?:[\w.-]+(?::\d+)?\/)*[\w.-]+(?::[\w.-]+)?$/
+    if (/(?:^| )build$/.test(op)) target = id(named('-t', '--tag'), image)
+    if (/(?:^| )push$|^run$|^start$/.test(op)) target = id(first, image)
+  } else {
+    if (/^(?:rollout (?:status|restart)|wait|get|describe|logs|scale|set image)$/.test(op)) {
+      target = id(first, /^[\w.-]+(?:\/[\w.-]+)?$/)
+      const next = pos[op.split(' ').length + 1]
+      if (target && !target.includes('/') && !target.startsWith('$') && op !== 'logs') {
+        const name = id(next, /^[\w.-]+$/); if (name) target += '/' + name
+      }
+    }
+    scope = id(named('-n', '--namespace'), /^[\w.-]+$/); role = 'namespace'
+    if (op === 'wait') {
+      step.category = 'Kubernetes resource wait'
+      const until = flags.get('--for')
+      if (until === 'create' || until === 'delete') step.condition = until === 'create' ? 'resource exists' : 'resource absent'
+      const simple = /^condition=(Ready|Available|Complete|Progressing|Established|Bound)(?:=(true|false|unknown))?$/i.exec(until ?? '')
+      if (simple) step.condition = `${simple[1]} is ${simple[2]?.toLowerCase() ?? 'true'}`
+    }
+    if (op === 'rollout status' && flags.get('--watch') === 'false') { delete step.waits; step.category = 'Kubernetes status read' }
+    if ((op === 'get' && named('-w', '--watch', '--watch-only') === 'true') || (op === 'logs' && named('-f', '--follow') === 'true')) step.waits = true
+  }
+  if (scope) step.target = `${target ? target + ', ' : ''}${role} ${scope}`
+  else if (target) step.target = target
+  return step
+}
+
 /** Describe one simple command (wrappers already removed). */
 export function classify(words: string[], limit?: string): Step | undefined {
   const program = basename(words[0] ?? '')
   if (!/^[\w.+-]{1,64}$/.test(program) || QUIET.has(program) || secretish.test(program) || knownToken.test(program)) return undefined
+  if (program === 'gh' || program === 'curl' || program === 'docker' || program === 'kubectl') return knownCli(program, words.slice(1), limit)
   // A credential option may take an ordinary-looking value in the next word.
   // Keep the operation before it, not that value as a target or a subcommand.
   let args = words.slice(1)
@@ -338,13 +501,15 @@ export function classify(words: string[], limit?: string): Step | undefined {
   if (category) step.category = category[1]
   if (targets.length) step.target = targets.join(', ')
   if (category?.[2]) step.waits = true
-  if (limit && /^\d{1,9}(?:\.\d{1,4})?[smhd]?$/.test(limit)) step.limit = limit
-  if (program === 'gh' && /^gh (pr checks|run watch)/.test(run) && args.includes('--watch')) step.waits = true
+  if (limit && numericLimit.test(limit)) step.limit = limit
   return step
 }
 
 type Context = {
-  cwd: string
+  cwd?: string
+  functions: Map<string, Lexed>
+  partial: boolean
+  budget: number
   reader: ScriptReader
   strictPaths: boolean
   files: Map<string, string>
@@ -400,10 +565,23 @@ function unwrap(words: string[]): { words: string[]; limit?: string; every?: str
   return { words: w, limit, every }
 }
 
-async function runScript(ctx: Context, path: string) {
+// Executed shells have their own cwd and definitions. A function or sourced file
+// runs in the caller; a parenthesized group inherits a copy of its definitions.
+async function inScope(ctx: Context, scope: 'caller' | 'shell' | 'subshell', body: () => Promise<void>) {
+  if (ctx.depth >= MAX_DEPTH) { ctx.partial = true; if (ctx.strictPaths) ctx.status = 'ignored'; return }
+  const { cwd, functions } = ctx
+  if (scope !== 'caller') ctx.functions = scope === 'shell' ? new Map() : new Map(functions)
+  ctx.depth++
+  try { await body() } finally {
+    ctx.depth--
+    if (scope !== 'caller') { ctx.cwd = cwd; ctx.functions = functions }
+  }
+}
+
+async function runScript(ctx: Context, path: string, sourced = false) {
   const entry = ctx.status === undefined
-  if (!literal(path)) { if (ctx.strictPaths) ctx.status = 'ignored'; else if (entry) ctx.status = 'dynamic'; ctx.steps.push({ run: 'script', target: 'computed path' }); return }
-  const full = join(ctx.cwd, path)
+  if (!literal(path) || (!ctx.cwd && !path.startsWith('/'))) { ctx.partial = true; if (ctx.strictPaths) ctx.status = 'ignored'; else if (entry) ctx.status = 'dynamic'; ctx.steps.push({ run: 'script', target: 'computed path' }); return }
+  const full = join(ctx.cwd ?? '', path)
   if (entry) ctx.name = basename(path)
   let body: string | undefined
   if (ctx.scripts < MAX_SCRIPTS && ctx.depth < MAX_DEPTH) {
@@ -413,31 +591,58 @@ async function runScript(ctx: Context, path: string) {
     body = got.body
   }
   if (body === undefined) {
+    ctx.partial = true
     if (ctx.strictPaths) ctx.status = 'ignored'; else if (entry) ctx.status = 'unavailable'
     const name = safeTarget(basename(path))
     ctx.steps.push(name ? { run: 'script', target: name } : { run: 'script' })
     return
   }
   if (entry) ctx.status = 'read'
-  ctx.depth++
-  try { await analyze(ctx, body) } finally { ctx.depth-- }
+  await inScope(ctx, sourced ? 'caller' : 'shell', () => analyze(ctx, lex(body)))
 }
 
-async function analyze(ctx: Context, text: string) {
-  const { cmds, loops } = lex(text)
+function fileGuard(cmd: Cmd): Step | undefined {
+  if (!cmd.guard) return undefined
+  const [op, ...args] = cmd.words
+  if (op === '[' || op === '[[') { if (args.pop() !== (op === '[' ? ']' : ']]')) return undefined }
+  else if (op !== 'test') return undefined
+  let positive = cmd.guard === 'until'
+  if (cmd.negated) positive = !positive
+  if (args[0] === '!') { positive = !positive; args.shift() }
+  const [predicate, path] = args
+  if (args.length !== 2 || !path || !literal(path)) return undefined
+  const kind = predicate === '-f' ? 'regular file' : predicate === '-d' ? 'directory' : predicate === '-e' ? 'path' : undefined
+  if (!kind) return undefined
+  const target = safeTarget(basename(path))
+  return { run: 'test', category: 'file wait', ...(target ? {target} : {}), condition: `${kind} ${positive ? 'exists' : 'absent'}`, waits: true }
+}
+
+async function analyze(ctx: Context, parsed: Lexed) {
+  const { cmds, loops } = parsed
+  if (parsed.partial) { ctx.partial = true; if (ctx.strictPaths) { ctx.status = 'ignored'; return } }
   const first = ctx.steps.length
   const stepLoop: (number | undefined)[] = []
   const add = (s: Step | undefined, loop?: number) => { if (s) { ctx.steps.push(s); stepLoop[ctx.steps.length - 1 - first] = loop } }
   for (const cmd of cmds) {
-    if (ctx.status === 'ignored' || ctx.steps.length > 200) break
+    if (ctx.status === 'ignored') break
+    if (--ctx.budget < 0 || ctx.steps.length > 200) { ctx.partial = true; if (ctx.strictPaths) ctx.status = 'ignored'; break }
+    if (cmd.definition) { ctx.functions.set(cmd.words[0]!, cmd.definition); continue }
+    if (cmd.subshell) { await inScope(ctx, 'subshell', () => analyze(ctx, cmd.subshell!)); continue }
+    const guard = fileGuard(cmd)
+    if (guard) { add(guard, cmd.loop); continue }
     // A file this command writes from a heredoc is known without reading the disk.
-    if (cmd.heredoc !== undefined && cmd.out && literal(cmd.out)) ctx.files.set(join(ctx.cwd, cmd.out), cmd.heredoc)
+    if (cmd.heredoc !== undefined && cmd.out && literal(cmd.out) && (ctx.cwd || cmd.out.startsWith('/'))) ctx.files.set(join(ctx.cwd ?? '', cmd.out), cmd.heredoc)
     const { words, limit, every } = unwrap(cmd.words)
     const program = basename(words[0] ?? '')
     if (!program) continue
+    const definition = ctx.functions.get(words[0]!)
+    if (definition && cmd.words.find(w => !/^[A-Za-z_]\w*=/.test(w)) === words[0]) {
+      await inScope(ctx, definition.groupedShell ? 'subshell' : 'caller', () => analyze(ctx, definition)); continue
+    }
     if (program === 'cd') {
       const to = words[1]
-      if (to && literal(to)) ctx.cwd = join(ctx.cwd, to).replace(/\/\.(?=\/|$)/g, '')
+      if (to && !to.startsWith('-') && literal(to) && (ctx.cwd || to.startsWith('/'))) ctx.cwd = join(ctx.cwd ?? '', to).replace(/\/\.(?=\/|$)/g, '')
+      else { ctx.cwd = undefined; ctx.partial = true }
       continue
     }
     if (SHELLS.has(program)) {
@@ -449,12 +654,12 @@ async function analyze(ctx: Context, text: string) {
         if (/^[-+][a-zA-Z]*o$/.test(f)) i++
       }
       if (code !== undefined) {
-        ctx.depth++
-        try { if (ctx.depth <= MAX_DEPTH) await analyze(ctx, code) } finally { ctx.depth-- }
+        const inline = lex(code)
+        await inScope(ctx, 'shell', () => analyze(ctx, inline))
       } else if (words[i]) await runScript(ctx, words[i]!)
       continue
     }
-    if (program === 'source' || program === '.') { if (words[1]) await runScript(ctx, words[1]); continue }
+    if (program === 'source' || program === '.') { if (words[1]) await runScript(ctx, words[1], true); continue }
     if (words[0]!.includes('/') && (/\.(?:ba)?sh$/.test(program) || !program.includes('.'))) { await runScript(ctx, words[0]!); continue }
     const step = classify(words, limit)
     if (step && every) { step.every = /^\d{1,9}(?:\.\d{1,4})?s$/.test(every) ? every : 'repeatedly'; step.waits = true }
@@ -465,7 +670,17 @@ async function analyze(ctx: Context, text: string) {
     const inLoop = ctx.steps.slice(first).map((s, i) => ({ s, i })).filter(x => stepLoop[x.i] === id)
     const sleep = inLoop.find(x => x.s.run === 'sleep')
     const others = inLoop.filter(x => x.s.run !== 'sleep')
-    if (!others.length) continue
+    if (!others.length) {
+      // A delay in a while/until loop is not a one-shot timer. If the guard
+      // was too complex to describe, don't guess what will end the polling.
+      if (sleep && kind !== 'for') {
+        const delay = sleep.s.target
+        Object.assign(sleep.s, { run: 'poll', category: 'polling loop', every: delay && /^\d+(\.\d+)?[smhd]?$/.test(delay) ? delay : 'repeatedly' })
+        delete sleep.s.target
+        ctx.partial = true
+      }
+      continue
+    }
     for (const { s } of others) {
       s.every = sleep?.s.target && /^\d+(\.\d+)?[smhd]?$/.test(sleep.s.target) ? sleep.s.target : 'repeatedly'
       if (kind !== 'for' || sleep) s.waits = true
@@ -481,19 +696,20 @@ function rank(s: Step) {
 
 /** Facts about one background command, reading the scripts it runs through `reader`. */
 export async function factsOf(command: string, cwd: string, reader: ScriptReader, strictPaths = false): Promise<Facts> {
-  const ctx: Context = { cwd, reader, strictPaths, files: new Map(), scripts: 0, depth: 0, steps: [] }
-  try { await analyze(ctx, command) } catch { if (strictPaths) ctx.status = 'ignored' }
+  const ctx: Context = { cwd, reader, strictPaths, files: new Map(), functions: new Map(), partial: false, budget: MAX_CMDS * 2, scripts: 0, depth: 0, steps: [] }
+  try { await analyze(ctx, lex(command)) } catch { ctx.partial = true; if (strictPaths) ctx.status = 'ignored' }
   if (ctx.status === 'ignored') return { scriptStatus: 'ignored', steps: [], omitted: 0 }
   // One entry per distinct operation and target, most telling first, in source order within a rank.
   const seen = new Set<string>()
   const unique = ctx.steps.filter(s => {
-    const key = `${s.run}|${s.target ?? ''}|${s.every ?? ''}`
+    const key = `${s.run}|${s.target ?? ''}|${s.every ?? ''}|${s.condition ?? ''}`
     if (seen.has(key)) return false
     seen.add(key); return true
   })
   const ordered = unique.map((s, i) => ({ s, i })).sort((a, b) => rank(a.s) - rank(b.s) || a.i - b.i).map(x => x.s)
   const steps = ordered.slice(0, MAX_STEPS)
   const facts: Facts = { scriptStatus: ctx.status ?? 'inline', steps, omitted: ordered.length - steps.length }
+  if (ctx.partial) facts.partial = true
   if (ctx.name) { const n = safeTarget(ctx.name); if (n) facts.script = n }
   return facts
 }
@@ -503,6 +719,10 @@ export function factLabel(f: Facts): string | undefined {
   const s = f.steps.find(x => x.waits && x.category) ?? f.steps.find(x => x.category && !LOW.has(x.category))
     ?? f.steps.find(x => x.waits) ?? f.steps[0]
   if (!s || s.run === 'script') return undefined
+  if (s.category === 'file wait' && s.condition) {
+    const action = s.condition.endsWith('absent') ? 'disappear' : 'appear'
+    return `${s.target ?? 'Path'} to ${action}${s.every && s.every !== 'repeatedly' ? ` (every ${s.every})` : ''}`
+  }
   const what = s.category ?? s.run
   const first = s.run === 'sleep' ? s.limit ?? s.target : s.target?.split(', ')[0]
   const target = first && !first.includes(' ') && first.length <= 32 ? ` ${first}` : ''
