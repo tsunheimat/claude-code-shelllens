@@ -32,15 +32,19 @@ function host(on: On, reply: Reply = {}) {
   const prompts: string[] = []
   const statuses: (string | undefined)[] = []
   const mtimes: Record<string, number> = {}
+  const reads: string[] = []
+  const files = { ...scripts, ...outputs }
   on('session.cwd', () => ({ value: '/workspace' }))
+  on('ui.log', () => ({ value: undefined }))
   on('ui.status', (_, e) => { statuses.push(e.text); return { value: undefined } })
   on('fs.stat', (_, e) => {
-    const body = scripts[e.path] ?? outputs[e.path]
+    const body = files[e.path]
     if (body === undefined) throw new Error('ENOENT')
     return { value: { kind: 'file', size: body.length, mtimeMs: mtimes[e.path] ?? 0, isLink: false, realPath: e.path } }
   })
   on('fs.read', (_, e) => {
-    const body = scripts[e.path] ?? outputs[e.path] ?? ''
+    reads.push(e.path)
+    const body = files[e.path] ?? ''
     return { value: body.slice(e.offset ?? 0, (e.offset ?? 0) + (e.length ?? body.length)) }
   })
   on('model.complete', async (_, e) => {
@@ -54,14 +58,14 @@ function host(on: On, reply: Reply = {}) {
   on('classic.Stop', () => ({}))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
-  return { clock, prompts, statuses, mtimes }
+  return { clock, prompts, statuses, mtimes, reads, files }
 }
 
 async function launch($: Engine, h: ReturnType<typeof host>, n = 3) {
   for (const t of TASKS.slice(0, n)) {
     const input = { command: t.command, description: t.description, run_in_background: true }
     await $.tool.call({ tool: 'Bash', tool_use_id: `use-${t.id}`, ...input })
-    await $.classic.PostToolUse({ tool_name: 'Bash', tool_use_id: `use-${t.id}`, tool_input: input,
+    await $.classic.PostToolUse({ tool_name: 'Bash', tool_use_id: `use-${t.id}`, cwd: '/workspace', tool_input: input,
       tool_response: { ...response, backgroundTaskId: t.id } })
     await $.session.append({ door: 'tool-result', origin: { kind: 'tool', tool: 'Bash' }, uuid: `row-${t.id}`,
       message: { type: 'user', content: [{ type: 'tool_result', tool_use_id: `use-${t.id}`,
@@ -76,6 +80,13 @@ function stop($: Engine, n = 3, crons: { prompt: string }[] = []) {
     session_crons: crons.map((c, i) => ({ id: `c${i}`, schedule: '*/5 * * * *', recurring: true, ...c })),
   } as never)
 }
+
+function finish($: Engine, id: string, kind: 'task-notification' | 'engine' = 'task-notification') {
+  return $.session.append({ door: 'queue', origin: { kind }, uuid: `done-${id}`, message: { type: 'user', content: [{
+    type: 'text', text: `<task-notification>\n<task-id>${id}</task-id>\n<status>completed</status>\n</task-notification>` }] } })
+}
+
+const payload = (prompt: string) => JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1))
 
 const lines = async ($: Engine, props: Partial<typeof BAND.props> = {}) => {
   const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, ...props } })
@@ -105,8 +116,8 @@ test('three scripts read as one goal, from their scripts and recent output, in o
   await stop($)
   await h.clock.advance(1000)
   expect(h.prompts).toHaveLength(1)
-  const prompt = h.prompts[0]!
-  for (const seen of ['gh run watch 1234', 'docker build', 'npm test', 'build: step 5/9', 'RUN npm ci', 'PASS src/a.test.ts'])
+  const prompt = JSON.stringify(payload(h.prompts[0]!))
+  for (const seen of ['gh run watch', 'docker build', 'npm test', 'build: step 5/9', 'RUN npm ci', 'PASS src/a.test.ts'])
     expect(prompt).toContain(seen)
   expect(prompt).not.toContain('private-test-marker')
   expect(prompt).not.toContain('leaked-output-marker')
@@ -118,23 +129,24 @@ test('three scripts read as one goal, from their scripts and recent output, in o
   expect(detail?.text).toMatch(/CI run watch 0:4\d · API image build 0:4\d · Unit tests 0:4\d · output \d+s ago/)
 })
 
-test('without a model answer the agent\'s own task descriptions still show', async ($, on) => {
+test('without a model answer generic descriptions improve from local facts', async ($, on) => {
   const h = host(on)
   await launch($, h, 1)
   await stop($, 1)
   await h.clock.advance(1500)
   const [head, detail] = await lines($)
-  expect(head?.text).toMatch(/^● Waiting 0:01 · Run sample A$/)
-  expect(detail?.text).toMatch(/^ {2}Run sample A 0:01/)
+  expect(head?.text).toMatch(/^● Waiting 0:01 · CI run watch 1234$/)
+  expect(detail?.text).toMatch(/^ {2}CI run watch 1234 0:01/)
 })
 
 test('a malformed or unsafe reply keeps the fallback', async ($, on) => {
-  const h = host(on, { text: '{"headline":"`rm -rf` <b>x</b>","tasks":["a","b","c"]}' })
+  const h = host(on, { text: '{"headline":"`rm -rf` <b>x</b>","tasks":["TOKEN=abc","$(y)","**z**"]}' })
   await launch($, h)
   await stop($)
   await h.clock.advance(1500)
   const [head] = await lines($)
-  expect(head?.text).toContain('Run sample A + Run sample B + Run sample C')
+  expect(head?.text).toContain('CI run watch 1234 and Container image build and Tests')
+  expect(head?.text).not.toContain('rm -rf')
 })
 
 test('stopped with nothing running says so, dimmed', async ($, on) => {
@@ -165,9 +177,9 @@ test('a finished task leaves the row at once, and the next turn hides it', async
   await launch($, h, 2)
   await stop($, 2)
   await h.clock.advance(1000)
-  await $.session.append({ door: 'queue', origin: { kind: 'engine' }, uuid: 'n1', message: { type: 'user', content: [{
-    type: 'text', text: '<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n</task-notification>' }] } })
-  const [, detail] = await lines($)
+  await finish($, 't1', 'engine')
+  const [headline, detail] = await lines($)
+  expect(headline?.text).not.toContain('CI')
   expect(detail?.text).not.toContain('CI ')
   expect(detail?.text).toContain('Image')
   await $.turn.start({ text: 'notification', turnId: 'next' })
@@ -182,6 +194,70 @@ test('a scheduled wakeup counts as waiting', async ($, on) => {
   expect(head?.text).toContain('Waiting')
   expect(detail?.text).toContain('wakeup scheduled')
   expect(h.prompts[0]).toContain('check the deploy pipeline')
+})
+
+test('ignored tasks contribute neither file contents nor output, even with masking off',
+  { options: { ignorePaths: 'ci.sh', redactSecrets: false } }, async ($, on) => {
+    const h = host(on)
+    h.files['/workspace/image.sh'] = 'docker build -t api .\nsource ci.sh\n'
+    await launch($, h)
+    await stop($)
+    await h.clock.advance(2000)
+    const [a, b, c] = payload(h.prompts[0]!).tasks
+    for (const task of [a, b]) {
+      expect(task.scriptStatus).toBe('ignored')
+      expect(task.steps).toHaveLength(0)
+      expect(task.recentOutput).toHaveLength(0)
+      expect(task.script).toBe(undefined)
+    }
+    for (const path of ['/workspace/ci.sh', '/claude/tasks/t1.output', '/claude/tasks/t2.output']) expect(h.reads).not.toContain(path)
+    expect(c.recentOutput).toContain('PASS src/a.test.ts')
+  })
+
+test('a single output change during cooldown is summarized once even if output then stops', async ($, on) => {
+  const h = host(on)
+  await launch($, h, 1)
+  await stop($, 1)
+  await h.clock.advance(100)
+  h.files['/claude/tasks/t1.output'] = 'package stage now running\n'
+  h.mtimes['/claude/tasks/t1.output'] = h.clock.now()
+  await h.clock.advance(59000)
+  expect(h.prompts).toHaveLength(1)
+  await h.clock.advance(2000)
+  expect(h.prompts).toHaveLength(2)
+  expect(payload(h.prompts[1]!).tasks[0].recentOutput).toContain('package stage now running')
+  await h.clock.advance(65000)
+  expect(h.prompts).toHaveLength(2)
+})
+
+test('discard an in-flight answer for finished work and refresh only the surviving task', async ($, on) => {
+  const h = host(on, { text: '{"headline":"Obsolete CI goal","tasks":["Old CI","Old image"]}', delay: 5000 })
+  await launch($, h, 2)
+  await stop($, 2)
+  await h.clock.advance(100)
+  expect(h.prompts).toHaveLength(1)
+  await finish($, 't1')
+  await h.clock.advance(5500)
+  const [head] = await lines($)
+  expect(head?.text).toContain('Container image build')
+  expect(head?.text).not.toContain('CI')
+  await h.clock.advance(55000)
+  expect(h.prompts).toHaveLength(2)
+  const tasks = payload(h.prompts[1]!).tasks
+  expect(tasks).toHaveLength(1)
+  expect(tasks[0].script).toBe('image.sh')
+})
+
+test('the last task ending becomes idle and a late answer cannot restart the row', async ($, on) => {
+  const h = host(on, { text: '{"headline":"Old CI goal","tasks":["Old CI"]}', delay: 5000 })
+  await launch($, h, 1)
+  await stop($, 1)
+  await h.clock.advance(100)
+  await finish($, 't1')
+  expect((await lines($))[0]?.text).toBe('○ Stopped — nothing running')
+  await h.clock.advance(65000)
+  expect((await lines($))[0]?.text).toBe('○ Stopped — nothing running')
+  expect(h.prompts).toHaveLength(1)
 })
 
 test('an answer that arrives after the agent resumed is dropped', async ($, on) => {

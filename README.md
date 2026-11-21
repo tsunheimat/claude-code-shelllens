@@ -11,7 +11,7 @@ While Claude is working it shows nothing: the spinner already says so. When it s
 
 ## Try it locally
 
-Requires Claude Code with native mod support (tested on **2.1.329**) and a model enabled by your session or gateway. From this checkout:
+Requires Claude Code with native mod support (live-tested on **2.1.330**). A session model or gateway is needed for model-written summaries, but not for local fallback labels. From this checkout:
 
 ```sh
 claude --plugin-dir "$PWD"
@@ -19,36 +19,42 @@ claude --plugin-dir "$PWD"
 
 Ask Claude to start a harmless script in the background and end its turn; `tests/manual/` has three. To install for future sessions across projects, run `claude plugin install shell-insight --marketplace "$PWD" --scope user` from this checkout. Configure it with `/plugin configure` and remove it with `claude plugin uninstall shell-insight@shell-insight-local`.
 
-**Privacy and cost:** when the agent stops with work running, the plugin sends the tasks' descriptions, commands, eligible script contents, the last 4 KB of their output and the agent's last message, sanitized, to the session's configured model endpoint, including a custom gateway. That is one request per stop, plus at most one a minute while new output appears. Redaction is best-effort, not a guarantee: disable the plugin in sensitive environments. It does not log or persist scripts, prompts or responses; the provider and Claude Code have their own policies.
+**Privacy:** script inspection happens locally. The summary request has no raw command or script-body field. It does include selected output and agent-written text, which can themselves contain private information or echo code. Credential masking is best-effort. Disable the plugin in sessions where this data must not reach the configured endpoint, including a custom gateway.
 
 ## What the row means
 
-- **Line 1** is everything the agent is waiting on, as one goal, written by one model request when the agent stops. It reads each task's command, its entry script and its newest output, plus the agent's last message. Until the answer arrives, or if there is none, it shows the agent's own task descriptions. `Waiting` counts from when the agent stopped.
+- **Line 1** describes all remaining work together. It appears immediately using task descriptions; local facts can replace generic labels such as `Run script A` with `Timer 100s`. One model request can then refine the headline and individual labels. `Waiting` counts from when the agent stopped.
 - **Line 2** lists each task with how long it has been running, then when any of them last wrote output.
-- **Colour:** a green `●` while output is recent; yellow, with `no output for 3m`, after two quiet minutes (it may be stuck, or just quiet); a grey `○` when nothing is running.
-- A finished task drops off at once. Scheduled wakeups (`/loop`, ScheduleWakeup) count as waiting too. The summary is redone at most once a minute while new output appears.
+- **Colour:** the waiting dot is green by default. When the newest known output is over two minutes old, it turns yellow and reports the quiet time. Silence is not proof of a hang. The idle `○` is grey.
+- A completion notification removes the task from both lines. Scheduled wakeups count as waiting too. Within a stopped turn, new output or a changed task set triggers at most one refresh per minute. A single change during cooldown is remembered. A reply for an old task set or turn is discarded.
 
 The row reports what the host says is still running and what the output files show. It does not watch CI itself or claim a result; a task's end is shown by Claude Code's own notification.
 
 ## Inspection policy
 
-- Reads one entry script per task, under the working directory or an explicitly named `.sh`/`.bash` directly in `/tmp`, using literal `bash`/`sh` invocations only. No globbing, sourcing, `eval` or execution. Hidden paths, traversal, symlinks, special files, oversized and non-text files are skipped.
-- Reads at most the last 4 KB of each task's output file, only the one Claude Code itself names for that task.
-- Checks placement and metadata before and after reads. This is not an isolation boundary against another process replacing files in a shared directory.
+- At background handoff the plugin parses the command without running it. It recognizes common wrappers such as `timeout`, `env`, and `rtk proxy`, and can inspect literal script invocations, `source` references, and a heredoc written then invoked by the command. It follows at most six script references and three levels of nesting. It does not execute the scripts, expand variables, or resolve globs.
+- Disk reads are limited to eligible scripts under the launch directory or an explicitly named `.sh`/`.bash` file directly in `/tmp`. A parsed `cd` does not widen that boundary. Hidden paths, traversal, symlinks, special files, oversized scripts and non-text files are skipped. Script placement and metadata are checked before and after reading. This is not an isolation boundary against another process replacing files.
+- A matched ignore rule withholds the whole task's script facts and output, even when masking is off. With rules configured, inspection starts only for an identifiable literal entry script. This rule does not remove mentions in the agent's own descriptions, last message, or scheduled reminders.
+
+## What the summary model receives
+
+One JSON record describes the pending work. Each task has a short ID, its description (up to 300 characters), inspection status, elapsed time when known, and up to 12 extracted operations. For example, a CI watcher can yield `{"run":"gh run watch","category":"CI run watch","target":"1234","waits":true}`. The record can include a script basename, a polling interval or timeout, and a count of omitted operations. These are clues about the work, not a trace of the currently executing line.
+
+For eligible tasks, the plugin samples the last 4 KiB of the host-reported output file and selects up to eight meaningful lines of at most 160 characters each. The request also includes the end of the last assistant message (about 700 characters), and schedules and short prompts for pending wakeups. The model is asked for one headline and one label per ID. Invalid fields keep their local fallback independently.
 
 ## Options
 
 | Option | Default | Behavior |
 | --- | --- | --- |
 | `enabled` | `true` | Set `false` to turn the row and model calls off. |
-| `model` | `haiku` | Host-approved alias or model ID. Rejection or timeout leaves the fallback. |
+| `model` | `haiku` | Host-approved alias or model ID, requested with low effort. The host or gateway resolves the alias. Rejection or timeout leaves the fallback. |
 | `language` | `en` | Language tag for the summary; the fixed words are English. |
 | `maxScriptBytes` | `65536` | Larger scripts are skipped; hard maximum 262144 bytes. |
 | `summaryTimeoutMs` | `10000` | Model deadline, clamped to 100-60000 ms. |
-| `redactSecrets` | `true` | Mask likely credentials in commands, scripts and output before the request. |
-| `ignorePaths` | empty | Literal file or directory paths, one per line. A matching script, and with rules set any task without one identifiable script, is described by its task description only. |
+| `redactSecrets` | `true` | Mask likely credentials in free text before selecting excerpts. Turning this off does not send script source or override ignored paths. |
+| `ignorePaths` | empty | Literal file or subtree paths, one per line, absolute or relative to the launch directory. See Inspection policy. |
 
-Raw-script and output logging is deliberately unavailable, including as an opt-in. The plugin only observes: it never intercepts `tool.call` or `tool.run`, which on this host would change Bash background and live-output forwarding.
+**Debugging:** start with `claude --plugin-dir "$PWD" --debug` and search the host debug log for `shell-insight: summary`. A line such as `tasks=3 ... facts=[read:4,read:1,read:1] model=haiku source=model headline=accepted labels=3/3` confirms that the model supplied the displayed wording; `source=fallback` gives a reason. The plugin's diagnostic does not include script bodies, output, prompts or replies. Host and provider logs have their own policies. The plugin only observes Bash; it never intercepts or reruns a command.
 
 ## Verify
 
