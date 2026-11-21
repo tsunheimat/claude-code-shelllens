@@ -9,17 +9,27 @@ When Claude stops and hands the prompt back while shells are still running, Shel
 
 While Claude is working it shows nothing: the spinner already says so. When it stops with nothing left running, the row reads `○ Stopped — nothing running`.
 
+## Install
+
+Requires Claude Code with native mod support (tested on **2.1.330**). Inside Claude Code, run:
+
+```text
+/plugin install shell-insight --marketplace tsunheimat/claude-code-shelllens
+```
+
+Confirm the marketplace and choose your installation scope. Run `/reload-plugins` or restart Claude Code to load the plugin. Use `/plugin configure` to change its options.
+
+**Privacy:** script inspection happens locally. Model-written summaries send selected output and agent-written text to your configured model endpoint, which can be a custom gateway. That text can contain private information or echo code, and credential masking is best-effort. Disable the plugin in sessions where this data must not reach the endpoint. Local fallback labels do not require a model response.
+
 ## Try it locally
 
-Requires Claude Code with native mod support (live-tested on **2.1.330**). A session model or gateway is needed for model-written summaries, but not for local fallback labels. From this checkout:
+From this checkout:
 
 ```sh
 claude --plugin-dir "$PWD"
 ```
 
 Ask Claude to start a harmless script in the background and end its turn; `tests/manual/` has three. To install for future sessions across projects, run `claude plugin install shell-insight --marketplace "$PWD" --scope user` from this checkout. Configure it with `/plugin configure` and remove it with `claude plugin uninstall shell-insight@shell-insight-local`.
-
-**Privacy:** script inspection happens locally. The summary request has no raw command or script-body field. It does include selected output and agent-written text, which can themselves contain private information or echo code. Credential masking is best-effort. Disable the plugin in sessions where this data must not reach the configured endpoint, including a custom gateway.
 
 ## What the row means
 

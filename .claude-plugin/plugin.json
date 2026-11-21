@@ -1,6 +1,7 @@
 {
   "name": "shell-insight",
   "version": "0.2.0",
+  "license": "MIT",
   "author": {
     "name": "Shell Insight contributors"
   },
