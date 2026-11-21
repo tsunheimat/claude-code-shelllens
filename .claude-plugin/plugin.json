@@ -1,0 +1,53 @@
+{
+  "name": "shell-insight",
+  "version": "0.2.0",
+  "author": {
+    "name": "Shell Insight contributors"
+  },
+  "description": "When the agent stops with shells still running, say what it is waiting for, in a row above the prompt.",
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Enable Shell Insight",
+      "description": "Show what the stopped agent is waiting for.",
+      "default": true
+    },
+    "model": {
+      "type": "string",
+      "title": "Summary model",
+      "description": "A model alias or ID accepted by the host.",
+      "default": "haiku"
+    },
+    "language": {
+      "type": "string",
+      "title": "Summary language",
+      "description": "Language tag for the waiting summary.",
+      "default": "en"
+    },
+    "maxScriptBytes": {
+      "type": "number",
+      "title": "Script byte limit",
+      "description": "Skip files larger than this limit.",
+      "default": 65536
+    },
+    "summaryTimeoutMs": {
+      "type": "number",
+      "title": "Model timeout",
+      "description": "Maximum model request duration in milliseconds.",
+      "default": 10000
+    },
+    "redactSecrets": {
+      "type": "boolean",
+      "title": "Redact likely secrets",
+      "description": "Mask common credentials before sending text to the model.",
+      "default": true
+    },
+    "ignorePaths": {
+      "type": "string",
+      "title": "Ignored paths",
+      "description": "One path per line. Never read or send matching scripts.",
+      "default": ""
+    }
+  },
+  "types": "./types/index.d.ts"
+}

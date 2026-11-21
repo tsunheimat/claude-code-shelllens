@@ -1,0 +1,6 @@
+{
+  "name": "shell-insight-local",
+  "description": "Local marketplace for the Shell Insight native mod.",
+  "owner": {"name": "Shell Insight contributors"},
+  "plugins": [{"name": "shell-insight", "source": "./"}]
+}
