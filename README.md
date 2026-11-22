@@ -1,5 +1,7 @@
 # Shell Insight
 
+**English** · [简体中文](README.zh-CN.md)
+
 When Claude Code hands you back the prompt, a background shell may still be running. Shell Insight adds a row just above the prompt showing **what is still running, for how long, and when it last produced output**. While Claude is working, the row stays hidden.
 
 ![Illustrated terminal: Claude stopped 36 seconds ago. The CI watcher and unit tests are still running, with output 11 seconds ago. The prompt is ready for input.](docs/images/waiting-preview.svg)
