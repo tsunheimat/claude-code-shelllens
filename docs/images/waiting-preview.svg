@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="244" viewBox="0 0 760 244" role="img" aria-labelledby="title desc">
+  <title id="title">Shell Insight above the Claude Code prompt</title>
+  <desc id="desc">Illustrated example: the prompt is back, but CI and unit tests are still running. Claude stopped 36 seconds ago; the newest output is 11 seconds old.</desc>
+  <rect x="1" y="1" width="758" height="242" rx="8" fill="#152222" stroke="#46615b" stroke-width="2"/>
+  <path d="M2 45h756" stroke="#425753"/>
+  <g fill="none" stroke="#9de4b9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="m24 16 7 7-7 7m13 0h8"/>
+  </g>
+  <g font-family="Liberation Sans, Arial, sans-serif" font-size="15" fill="#cee1d9">
+    <text x="60" y="29" font-weight="bold">Shell Insight</text>
+    <text x="736" y="29" text-anchor="end">Terminal example</text>
+  </g>
+  <g font-family="Liberation Mono, Courier New, monospace">
+    <text x="26" y="82" fill="#c4d0ca" font-size="17">The CI watcher and unit tests are running in the background.</text>
+    <circle cx="33" cy="127" r="6.5" fill="#8de5ae"/>
+    <text x="52" y="134" fill="#f1f6f3" font-size="21" xml:space="preserve"><tspan font-weight="bold">Waiting 0:36</tspan><tspan> · CI run and unit tests</tspan><tspan fill="#b4c3bc"> (2 tasks)</tspan></text>
+    <text x="52" y="163" fill="#bbcbc3" font-size="17">CI run watch 0:44 · Unit tests 0:38 · output 11s ago</text>
+    <path d="M26 185h708m-708 47h708" stroke="#536661"/>
+    <path d="m29 201 8 7-8 7" fill="none" stroke="#ecf3ef" stroke-width="2.5"/>
+    <rect x="50" y="198" width="10" height="20" fill="#a7b9af"/>
+  </g>
+</svg>

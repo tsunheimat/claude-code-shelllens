@@ -1,42 +1,48 @@
 # Shell Insight
 
-When Claude stops and hands the prompt back while shells are still running, Shell Insight says what it is waiting for, in a row directly above the prompt:
+When Claude Code hands you back the prompt, a background shell may still be running. Shell Insight adds a row just above the prompt showing **what is still running, for how long, and when it last produced output**. While Claude is working, the row stays hidden.
 
-```
-● Waiting 0:36 · CI run, API image and unit tests (3 tasks)
-  CI run watch 0:44 · API image build 0:41 · Unit tests 0:38 · output 11s ago
-```
+![Illustrated terminal: Claude stopped 36 seconds ago. The CI watcher and unit tests are still running, with output 11 seconds ago. The prompt is ready for input.](docs/images/waiting-preview.svg)
 
-While Claude is working it shows nothing: the spinner already says so. When it stops with nothing left running, the row reads `○ Stopped — nothing running`.
+[Install](#install) · [Try it](#try-it) · [Read the row](#what-the-row-means) · [Options](#options)
 
 ## Install
 
-Requires Claude Code with native mod support (tested on **2.1.330**). Inside Claude Code, run:
+You need Claude Code with native mod support (tested on **2.1.330**). No clone or npm install is needed. At the **Claude Code prompt**, enter:
 
 ```text
 /plugin install shell-insight --marketplace tsunheimat/claude-code-shelllens
 ```
 
-Confirm the marketplace and choose your installation scope. Run `/reload-plugins` or restart Claude Code to load the plugin. Use `/plugin configure` to change its options.
+Confirm the marketplace and choose your scope (**user** makes it available across your projects). Run `/reload-plugins` or restart Claude Code.
+
+Prefer a **shell command**? This installs the same plugin for your user:
+
+```sh
+claude plugin install shell-insight --marketplace tsunheimat/claude-code-shelllens --scope user
+```
 
 **Privacy:** script inspection happens locally. Model-written summaries send selected output and agent-written text to your configured model endpoint, which can be a custom gateway. That text can contain private information or echo code, and credential masking is best-effort. Disable the plugin in sessions where this data must not reach the endpoint. Local fallback labels do not require a model response.
 
-## Try it locally
+## Try it
 
-From this checkout:
+Give Claude this prompt in any project:
 
-```sh
-claude --plugin-dir "$PWD"
+```text
+Run sleep 30 as a background Bash task, then end your turn without waiting for it.
 ```
 
-Ask Claude to start a harmless script in the background and end its turn; `tests/manual/` has three. To install for future sessions across projects, run `claude plugin install shell-insight --marketplace "$PWD" --scope user` from this checkout. Configure it with `/plugin configure` and remove it with `claude plugin uninstall shell-insight@shell-insight-local`.
+Once Claude returns the prompt, look just above it for `● Waiting`. After the timer finishes and Claude Code reports completion, the row reads `○ Stopped — nothing running` if no other work remains. The task label can vary; the state is what to look for.
 
 ## What the row means
 
-- **Line 1** describes all remaining work together. It appears immediately using task descriptions; local facts can replace generic labels such as `Run script A` with `Timer 100s`. One model request can then refine the headline and individual labels. `Waiting` counts from when the agent stopped.
-- **Line 2** lists each task with how long it has been running, then when any of them last wrote output.
-- **Colour:** the waiting dot is green by default. When the newest known output is over two minutes old, it turns yellow and reports the quiet time. Silence is not proof of a hang. The idle `○` is grey.
-- A completion notification removes the task from both lines. Scheduled wakeups count as waiting too. Within a stopped turn, new output or a changed task set triggers at most one refresh per minute. A single change during cooldown is remembered. A reply for an old task set or turn is discarded.
+In the preview above, **`Waiting 0:36`** counts from when Claude stopped, but **`CI run watch 0:44`** counts from when that task started. **`output 11s ago`** is the newest known output across the remaining tasks.
+
+![Two illustrated states: a yellow waiting dot and “no output for 3m” mean the CI watcher is still running. A hollow dot and “Stopped — nothing running” mean no work remains.](docs/images/quiet-and-idle.svg)
+
+The waiting dot is green by default. It turns yellow when the newest known output is more than two minutes old. A quiet shell is not necessarily stuck. A completion notification removes the task from the row; scheduled wakeups also count as pending work.
+
+Labels appear immediately from task descriptions and local facts. A model request can refine them. During the same stopped turn, the plugin refreshes at most once per minute when output or the task set changes, remembers changes during cooldown, and discards stale replies.
 
 The row reports what the host says is still running and what the output files show. It does not watch CI itself or claim a result; a task's end is shown by Claude Code's own notification.
 
@@ -57,6 +63,8 @@ For eligible tasks, the plugin samples the last 4 KiB of the host-reported outpu
 
 ## Options
 
+Open `/plugin configure shell-insight@shell-insight-local` in Claude Code to change these settings.
+
 | Option | Default | Behavior |
 | --- | --- | --- |
 | `enabled` | `true` | Set `false` to turn the row and model calls off. |
@@ -68,6 +76,16 @@ For eligible tasks, the plugin samples the last 4 KiB of the host-reported outpu
 | `ignorePaths` | empty | Literal file or subtree paths, one per line, absolute or relative to the launch directory. See Inspection policy. |
 
 **Debugging:** start with `claude --plugin-dir "$PWD" --debug` and search the host debug log for `shell-insight: summary`. A line such as `tasks=3 ... facts=[read:4,read:1,read:1] model=haiku source=model headline=accepted labels=3/3` confirms that the model supplied the displayed wording. `source=fallback` means no model wording was used, `source=retained` means prior wording was kept, and `source=discarded` marks a stale request. The plugin's diagnostic does not include script bodies, output, prompts or replies. Host and provider logs have their own policies. The plugin only observes Bash; it never intercepts or reruns a command.
+
+## Local development
+
+From this checkout, load the working copy for one session:
+
+```sh
+claude --plugin-dir "$PWD"
+```
+
+The [manual examples](tests/manual/) include a timer and other background scripts. To remove a persistent marketplace installation, run `claude plugin uninstall shell-insight@shell-insight-local` in your shell.
 
 ## Verify
 
